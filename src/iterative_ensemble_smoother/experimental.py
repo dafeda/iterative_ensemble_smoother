@@ -12,6 +12,7 @@ import numpy as np
 import numpy.typing as npt
 import scipy as sp  # type: ignore
 from joblib import Parallel, delayed
+from sklearn.linear_model import ElasticNetCV
 
 from iterative_ensemble_smoother import ESMDA
 from iterative_ensemble_smoother.esmda import BaseESMDA
@@ -29,6 +30,269 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 ENABLE_MEMORY_LOGGING_FOR_DISTANCE_BASED_LOCALIZATION = True
+
+
+class ISIS_ESMDA(BaseESMDA):
+    """ESMDA with Iterative Sure Independence Screening (ISIS) for adaptive localization.
+
+    This class implements ISIS (Fan & Lv, 2008) for variable screening instead of
+    simple marginal correlation thresholding. ISIS is better at detecting parameters
+    that have weak marginal correlations but strong conditional correlations with
+    the responses (i.e., parameters whose importance is masked by other variables).
+
+    The ISIS algorithm works as follows:
+    1. Initial screening: Select top d parameters with highest marginal correlations
+    2. Fit an Elastic Net model with selected parameters
+    3. Compute residuals from the fit
+    4. Re-screen remaining parameters against residuals
+    5. Iterate until convergence or max iterations reached
+
+    This implementation uses Elastic Net regression (as recommended in ISIS+,
+    Fan & Song 2010) instead of OLS, which provides better stability when
+    selected parameters are correlated or when the number of selected parameters
+    approaches the ensemble size.
+
+    References
+    ----------
+    Fan, J., & Lv, J. (2008). Sure independence screening for ultrahigh dimensional
+    feature space. Journal of the Royal Statistical Society: Series B, 70(5), 849-911.
+
+    Fan, J., & Song, R. (2010). Sure independence screening in generalized linear
+    models with NP-dimensionality. The Annals of Statistics, 38(6), 3567-3604.
+    """
+
+    @staticmethod
+    def isis_screening(
+        X: npt.NDArray[np.double],
+        Y: npt.NDArray[np.double],
+        max_iterations: int = 5,
+        d: Optional[int] = None,
+    ) -> npt.NDArray[np.bool_]:
+        """Perform Iterative Sure Independence Screening (ISIS) with Elastic Net.
+
+        This implements ISIS with Elastic Net regression for computing residuals.
+        In each iteration, the top d parameters (by correlation with residuals)
+        are selected, then Elastic Net is used to regress the response on selected
+        parameters to compute residuals for the next iteration.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Parameter matrix of shape (num_parameters, ensemble_size).
+        Y : np.ndarray
+            Response matrix of shape (num_observations, ensemble_size).
+        max_iterations : int
+            Maximum number of ISIS iterations. Default is 5.
+        d : int or None
+            Number of parameters to select per iteration.
+            If None, uses floor(ensemble_size / log(ensemble_size)) as
+            recommended by Fan & Lv (2008).
+
+        Returns
+        -------
+        significant : np.ndarray
+            Boolean mask of shape (num_parameters, num_observations) indicating
+            which parameter-response pairs are significant.
+        """
+        num_params, ensemble_size = X.shape
+        num_obs = Y.shape[0]
+
+        # Default d: floor(n / log(n)) as suggested by Fan & Lv (2008)
+        if d is None:
+            d = max(1, int(ensemble_size / np.log(ensemble_size + 1)))
+
+        # Initialize: all parameters are candidates, none are selected
+        significant = np.zeros((num_params, num_obs), dtype=bool)
+
+        # Center X and Y
+        X_centered = X - np.mean(X, axis=1, keepdims=True)
+        Y_centered = Y - np.mean(Y, axis=1, keepdims=True)
+
+        # Compute standard deviations (with small epsilon to avoid division by zero)
+        eps = 1e-10
+        stds_X = np.std(X, axis=1, ddof=1)
+        stds_X = np.where(stds_X < eps, eps, stds_X)
+
+        # Process each observation/response independently
+        for obs_idx in range(num_obs):
+            y = Y_centered[obs_idx, :]  # Shape: (ensemble_size,)
+
+            # Track selected and remaining parameter indices
+            selected_params: List[int] = []
+            remaining_params = list(range(num_params))
+
+            # Current residual (starts as the response itself)
+            residual = y.copy()
+
+            for iteration in range(max_iterations):
+                if not remaining_params:
+                    break
+
+                # Compute correlations between remaining parameters and residual
+                X_remaining = X_centered[remaining_params, :]  # (n_remaining, ensemble)
+                stds_remaining = stds_X[remaining_params]
+
+                # Correlation: cov(X_i, residual) / (std_X_i * std_residual)
+                std_residual = np.std(residual, ddof=1)
+                if std_residual < eps:
+                    # Residual has no variance - we've explained everything
+                    break
+
+                # Compute correlations with residual
+                cov_with_residual = (
+                    np.mean(X_remaining * residual[np.newaxis, :], axis=1)
+                    - np.mean(X_remaining, axis=1) * np.mean(residual)
+                )
+                correlations = np.abs(cov_with_residual / (stds_remaining * std_residual))
+
+                # Select top d parameters (original ISIS: no threshold, just top d)
+                n_select = min(d, len(remaining_params))
+                top_indices = np.argsort(correlations)[-n_select:]
+                new_selected = [remaining_params[i] for i in top_indices]
+
+                if not new_selected:
+                    break
+
+                # Add newly selected parameters
+                selected_params.extend(new_selected)
+                for p in new_selected:
+                    remaining_params.remove(p)
+
+                # Update residual using Elastic Net regression
+                # X_sel shape: (ensemble_size, n_selected)
+                X_sel = X_centered[selected_params, :].T
+
+                try:
+                    # Use ElasticNetCV with automatic cross-validation for lambda
+                    # l1_ratio=0.5 gives equal weight to L1 and L2 penalties
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=sp.optimize.OptimizeWarning)
+                        warnings.filterwarnings("ignore", message=".*Objective did not converge.*")
+                        model = ElasticNetCV(
+                            l1_ratio=0.5,
+                            cv=min(5, ensemble_size),  # 5-fold CV or less if small ensemble
+                            fit_intercept=False,  # Data is already centered
+                            max_iter=10000,
+                        )
+                        model.fit(X_sel, y)
+                    y_predicted = model.predict(X_sel)
+                    residual = y - y_predicted
+                except Exception:
+                    # If Elastic Net fails, stop iterating
+                    break
+
+            # Mark selected parameters as significant for this observation
+            for p in selected_params:
+                significant[p, obs_idx] = True
+
+        return significant
+
+    def assimilate(
+        self,
+        *,
+        X: npt.NDArray[np.double],
+        Y: npt.NDArray[np.double],
+        D: npt.NDArray[np.double],
+        overwrite: bool = False,
+        alpha: float,
+        cov_YY: Optional[npt.NDArray[np.double]] = None,
+        progress_callback: Optional[Callable[[Sequence[T]], Sequence[T]]] = None,
+        n_jobs: int = 1,
+        max_iterations: int = 5,
+        d: Optional[int] = None,
+    ) -> npt.NDArray[np.double]:
+        """Assimilate data using ISIS for adaptive localization.
+
+        This method uses Iterative Sure Independence Screening (ISIS) to identify
+        significant parameter-response relationships, which is better at detecting
+        conditionally important parameters than simple marginal correlation screening.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            A 2D array of shape (num_parameters, ensemble_size).
+        Y : np.ndarray
+            2D array of shape (num_observations, ensemble_size), containing
+            responses when evaluating the model at X.
+        D : np.ndarray
+            2D array of shape (num_observations, ensemble_size), containing
+            perturbed observations.
+        alpha : float
+            The covariance inflation factor.
+        overwrite : bool
+            If True, X will be overwritten and mutated.
+        cov_YY : np.ndarray or None
+            Pre-computed empirical covariance of Y.
+        progress_callback : Callable or None
+            Callback for progress reporting.
+        n_jobs : int
+            Number of parallel jobs. Default is 1.
+        max_iterations : int
+            Maximum number of ISIS iterations. Default is 5.
+        d : int or None
+            Number of parameters to select per ISIS iteration.
+            If None, uses floor(ensemble_size / log(ensemble_size)).
+
+        Returns
+        -------
+        X_posterior : np.ndarray
+            2D array of shape (num_parameters, ensemble_size).
+        """
+        assert X.shape[1] == Y.shape[1]
+
+        if not overwrite:
+            X = np.copy(X)
+
+        if progress_callback is None:
+
+            def progress_callback(x):
+                return x
+
+        # Step 1: Use ISIS for screening
+        significant_corr_XY = self.isis_screening(
+            X=X,
+            Y=Y,
+            max_iterations=max_iterations,
+            d=d,
+        )
+
+        # Step 2: Compute cross-covariance for significant pairs
+        cov_XY = empirical_cross_covariance(X, Y)
+        assert cov_XY.shape == (X.shape[0], Y.shape[0])
+
+        # Zero out insignificant correlations in the covariance
+        cov_XY_masked = np.where(significant_corr_XY, cov_XY, 0.0)
+
+        # Pre-compute cov(Y, Y)
+        if cov_YY is None:
+            cov_YY = empirical_cross_covariance(Y, Y)
+        else:
+            assert cov_YY.ndim == 2
+            assert cov_YY.shape == (Y.shape[0], Y.shape[0])
+
+        # Identify rows with at least one significant correlation
+        significant_rows = np.any(significant_corr_XY, axis=1)
+        params_to_update = np.where(significant_rows)[0]
+
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(AdaptiveESMDA._update_single_parameter)(
+                param_num,
+                significant_corr_XY[param_num],
+                cov_XY_masked[param_num],
+                Y,
+                D,
+                self.C_D,
+                cov_YY,
+                alpha,
+                AdaptiveESMDA.compute_cross_covariance_multiplier,
+            )
+            for param_num in progress_callback(params_to_update)
+        )
+
+        for param_num, update_vector in results:
+            X[[param_num], :] += update_vector
+
+        return X
 
 
 class AdaptiveESMDA(BaseESMDA):
