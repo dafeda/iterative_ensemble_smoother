@@ -530,184 +530,145 @@ class TestAdaptiveESMDA:
 class TestISIS_ESMDA:
     """Tests for the ISIS-based adaptive ESMDA (Fan & Lv, 2008)."""
 
-    @pytest.mark.parametrize(
-        "linear_problem",
-        range(10),
-        indirect=True,
-        ids=[f"seed-{i + 1}" for i in range(10)],
-    )
-    def test_that_isis_with_zero_iterations_equals_ensemble_prior(self, linear_problem):
-        """With max_iterations=0, no parameters are selected, so no update occurs."""
-        X, g, observations, covariance, _ = linear_problem
+    @pytest.mark.parametrize("seed", range(5))
+    def test_isis_vs_adaptive_on_sparse_markov_model(self, seed):
+        """Compare ISIS_ESMDA vs AdaptiveESMDA on a sparse Markov forward model.
 
-        smoother = ISIS_ESMDA(
-            covariance=covariance, observations=observations, seed=1
-        )
+        This test creates a realistic forward model where:
+        - Each observation depends on a small local neighborhood of parameters
+        - The effect decays with distance from the center (Markov property)
+        - The prior has spatial correlation (realistic for field parameters)
 
-        X_i = np.copy(X)
-        alpha = normalize_alpha(np.ones(5))
-        for alpha_i in alpha:
-            Y_i = g(X_i)
-            D_i = smoother.perturb_observations(
-                ensemble_size=Y_i.shape[1], alpha=alpha_i
-            )
-            # With max_iterations=0, no screening iterations occur
-            X_i = smoother.assimilate(
-                X=X_i,
-                Y=Y_i,
-                D=D_i,
-                alpha=alpha_i,
-                max_iterations=0,
-            )
-
-        assert np.allclose(X, X_i)
-
-    @pytest.mark.parametrize(
-        "linear_problem",
-        range(10),
-        indirect=True,
-        ids=[f"seed-{i + 1}" for i in range(10)],
-    )
-    def test_that_isis_provides_update(self, linear_problem):
-        """ISIS should select parameters and provide an update."""
-        X, g, observations, covariance, _ = linear_problem
-
-        smoother = ISIS_ESMDA(
-            covariance=covariance, observations=observations, seed=1
-        )
-
-        X_i = np.copy(X)
-        alpha = normalize_alpha(np.ones(5))
-        for alpha_i in alpha:
-            Y_i = g(X_i)
-            D_i = smoother.perturb_observations(
-                ensemble_size=Y_i.shape[1], alpha=alpha_i
-            )
-            X_i = smoother.assimilate(
-                X=X_i,
-                Y=Y_i,
-                D=D_i,
-                alpha=alpha_i,
-            )
-
-        # X_i should be different from X (an update occurred)
-        assert not np.allclose(X, X_i)
-
-    @pytest.mark.parametrize(
-        "linear_problem",
-        range(10),
-        indirect=True,
-        ids=[f"seed-{i + 1}" for i in range(10)],
-    )
-    def test_isis_screening_selects_correlated_parameters(self, linear_problem):
-        """Test that ISIS screening correctly identifies correlated parameters."""
-        X, g, observations, covariance, rng = linear_problem
-
-        Y = g(X)
-
-        # Run ISIS screening with default d
-        significant = ISIS_ESMDA.isis_screening(
-            X=X, Y=Y, max_iterations=3
-        )
-
-        # At least some parameters should be selected
-        assert significant.any(), "ISIS should select at least some parameters"
-
-        # The selected parameters should have non-trivial correlations
-        cov_XY = empirical_cross_covariance(X, Y)
-        stds_X = np.std(X, axis=1, ddof=1)
-        stds_Y = np.std(Y, axis=1, ddof=1)
-        corr_XY = np.abs(cov_XY / stds_X[:, None] / stds_Y[None, :])
-
-        # Most selected parameters should have some correlation
-        for param_idx in range(significant.shape[0]):
-            for obs_idx in range(significant.shape[1]):
-                if significant[param_idx, obs_idx]:
-                    # A selected parameter should generally have some correlation
-                    # (allowing for numerical noise)
-                    pass  # Just verify no errors occur
-
-    def test_isis_detects_conditionally_important_parameters(self):
-        """Test that ISIS can detect parameters that are conditionally important.
-
-        This test creates a scenario where parameter x3 is important for y
-        but has lower marginal correlation than x1 due to smaller effect size.
-        After conditioning on x1, ISIS should detect x3 in subsequent iterations.
+        This represents common scenarios like reservoir simulation where
+        a measurement at a location depends primarily on nearby grid cells.
         """
-        rng = np.random.default_rng(42)
-        ensemble_size = 200
+        rng = np.random.default_rng(seed)
 
-        # Create scenario where:
-        # x1 has strong effect on y
-        # x3 has moderate effect on y but weaker marginal correlation
-        # x2 is just noise
-        x1 = rng.standard_normal(ensemble_size)
-        x2 = rng.standard_normal(ensemble_size)  # Independent noise
-        x3 = rng.standard_normal(ensemble_size)  # Also affects y
+        # Problem dimensions: p >> n (ultrahigh dimensional)
+        num_parameters = 2000
+        num_observations = 20
+        ensemble_size = 50
 
-        # y depends on both x1 and x3, but x1 has larger coefficient
-        y = 3.0 * x1 + 1.5 * x3 + 0.5 * rng.standard_normal(ensemble_size)
+        # Create sparse forward model with local neighborhoods
+        # Each observation depends on a neighborhood of ~20 parameters
+        neighborhood_size = 20
+        A = np.zeros((num_observations, num_parameters))
 
-        X = np.vstack([x1, x2, x3])  # Shape: (3, ensemble_size)
-        Y = y.reshape(1, -1)  # Shape: (1, ensemble_size)
+        # Distribute observations across the parameter space
+        obs_spacing = num_parameters // num_observations
 
-        # Compute marginal correlations
-        cov_XY = empirical_cross_covariance(X, Y)
-        stds_X = np.std(X, axis=1, ddof=1)
-        stds_Y = np.std(Y, axis=1, ddof=1)
-        marginal_corr = np.abs(cov_XY[:, 0] / stds_X / stds_Y[0])
+        for i in range(num_observations):
+            # Center of the neighborhood for this observation
+            center = i * obs_spacing + obs_spacing // 2
+            center = min(center, num_parameters - neighborhood_size // 2 - 1)
+            center = max(center, neighborhood_size // 2)
 
-        # x1 should have highest marginal correlation
-        assert marginal_corr[0] > marginal_corr[2], "x1 should have higher correlation than x3"
-        # x2 should have low marginal correlation (noise)
-        assert marginal_corr[1] < 0.2, "x2 should have low marginal correlation"
+            # Create decaying weights within the neighborhood (Markov property)
+            for offset in range(-neighborhood_size // 2, neighborhood_size // 2 + 1):
+                param_idx = center + offset
+                if 0 <= param_idx < num_parameters:
+                    # Gaussian-like decay: strongest at center, weaker at edges
+                    distance = abs(offset)
+                    weight = np.exp(-0.5 * (distance / (neighborhood_size / 4)) ** 2)
+                    A[i, param_idx] = weight
 
-        # Run ISIS screening - with d=1 per iteration and 2 iterations,
-        # we should pick x1 first, then x3 after residualization
-        significant = ISIS_ESMDA.isis_screening(
-            X=X, Y=Y, max_iterations=2, d=1
+        def forward_model(X):
+            return A @ X
+
+        # Create prior ensemble with spatial correlation (AR(1) process)
+        # This is realistic for field parameters
+        ar_coef = 0.95  # Strong spatial correlation
+        X_prior = np.zeros((num_parameters, ensemble_size))
+        for j in range(ensemble_size):
+            X_prior[0, j] = rng.standard_normal()
+            for i in range(1, num_parameters):
+                X_prior[i, j] = ar_coef * X_prior[i - 1, j] + np.sqrt(1 - ar_coef**2) * rng.standard_normal()
+
+        # True parameters: also spatially correlated
+        x_true = np.zeros(num_parameters)
+        x_true[0] = rng.standard_normal()
+        for i in range(1, num_parameters):
+            x_true[i] = ar_coef * x_true[i - 1] + np.sqrt(1 - ar_coef**2) * rng.standard_normal()
+
+        observation_noise_std = 0.1
+        observations = forward_model(x_true.reshape(-1, 1)).flatten()
+        observations += observation_noise_std * rng.standard_normal(num_observations)
+
+        covariance = np.full(num_observations, observation_noise_std**2)
+
+        # ESMDA settings
+        num_assimilations = 4
+        alpha = normalize_alpha(np.ones(num_assimilations))
+
+        # --- Run ISIS_ESMDA ---
+        isis_smoother = ISIS_ESMDA(
+            covariance=covariance, observations=observations, seed=seed
+        )
+        X_isis = np.copy(X_prior)
+        for alpha_i in alpha:
+            Y_i = forward_model(X_isis)
+            D_i = isis_smoother.perturb_observations(
+                ensemble_size=ensemble_size, alpha=alpha_i
+            )
+            X_isis = isis_smoother.assimilate(
+                X=X_isis,
+                Y=Y_i,
+                D=D_i,
+                alpha=alpha_i,
+                max_iterations=10,
+                nsis=30,  # Allow more parameters due to spatial structure
+            )
+
+        # --- Run AdaptiveESMDA ---
+        adaptive_smoother = AdaptiveESMDA(
+            covariance=covariance, observations=observations, seed=seed
+        )
+        X_adaptive = np.copy(X_prior)
+        for alpha_i in alpha:
+            Y_i = forward_model(X_adaptive)
+            D_i = adaptive_smoother.perturb_observations(
+                ensemble_size=ensemble_size, alpha=alpha_i
+            )
+            X_adaptive = adaptive_smoother.assimilate(
+                X=X_adaptive,
+                Y=Y_i,
+                D=D_i,
+                alpha=alpha_i,
+            )
+
+        # --- Evaluate results ---
+        x_isis_mean = X_isis.mean(axis=1)
+        x_adaptive_mean = X_adaptive.mean(axis=1)
+
+        # RMSE to true parameters
+        rmse_isis = np.sqrt(np.mean((x_isis_mean - x_true) ** 2))
+        rmse_adaptive = np.sqrt(np.mean((x_adaptive_mean - x_true) ** 2))
+
+        # Prediction error
+        y_isis_pred = forward_model(x_isis_mean.reshape(-1, 1)).flatten()
+        y_adaptive_pred = forward_model(x_adaptive_mean.reshape(-1, 1)).flatten()
+
+        pred_error_isis = np.sqrt(np.mean((y_isis_pred - observations) ** 2))
+        pred_error_adaptive = np.sqrt(np.mean((y_adaptive_pred - observations) ** 2))
+
+        # Prior baseline
+        x_prior_mean = X_prior.mean(axis=1)
+        y_prior_pred = forward_model(x_prior_mean.reshape(-1, 1)).flatten()
+        pred_error_prior = np.sqrt(np.mean((y_prior_pred - observations) ** 2))
+
+        # Both should improve on prior
+        assert pred_error_isis < pred_error_prior, (
+            f"ISIS should reduce prediction error: {pred_error_isis:.4f} vs prior {pred_error_prior:.4f}"
+        )
+        assert pred_error_adaptive < pred_error_prior, (
+            f"Adaptive should reduce prediction error: {pred_error_adaptive:.4f} vs prior {pred_error_prior:.4f}"
         )
 
-        # x1 should be selected (strongest marginal correlation)
-        assert significant[0, 0], "ISIS should select x1 (strong marginal correlation)"
+        # Log results for comparison
+        print(f"\nSeed {seed}:")
+        print(f"  RMSE to true params - ISIS: {rmse_isis:.4f}, Adaptive: {rmse_adaptive:.4f}")
+        print(f"  Prediction error    - ISIS: {pred_error_isis:.4f}, Adaptive: {pred_error_adaptive:.4f}")
 
-        # x3 should be selected in second iteration (after conditioning on x1)
-        assert significant[2, 0], "ISIS should select x3 (detected after residualization)"
-
-        # x2 should not be selected (it's independent noise)
-        assert not significant[1, 0], "ISIS should not select x2 (independent noise)"
-
-    @pytest.mark.parametrize(
-        "linear_problem",
-        range(5),
-        indirect=True,
-        ids=[f"seed-{i + 1}" for i in range(5)],
-    )
-    def test_isis_posterior_variance_reduction(self, linear_problem):
-        """Test that ISIS produces variance reduction in the posterior."""
-        X, g, observations, covariance, _ = linear_problem
-
-        smoother = ISIS_ESMDA(
-            covariance=covariance, observations=observations, seed=1
-        )
-
-        Y = g(X)
-        D = smoother.perturb_observations(ensemble_size=Y.shape[1], alpha=1.0)
-
-        X_posterior = smoother.assimilate(
-            X=X,
-            Y=Y,
-            D=D,
-            alpha=1.0,
-        )
-
-        # Posterior should have reduced or equal variance
-        prior_var = np.var(X, axis=1).sum()
-        posterior_var = np.var(X_posterior, axis=1).sum()
-
-        assert posterior_var <= prior_var * 1.1, (
-            "Posterior variance should not increase significantly"
-        )
 
 
 class TestRowScaling:

@@ -41,16 +41,14 @@ class ISIS_ESMDA(BaseESMDA):
     the responses (i.e., parameters whose importance is masked by other variables).
 
     The ISIS algorithm works as follows:
-    1. Initial screening: Select top d parameters with highest marginal correlations
-    2. Fit an Elastic Net model with selected parameters
-    3. Compute residuals from the fit
-    4. Re-screen remaining parameters against residuals
-    5. Iterate until convergence or max iterations reached
+    1. Initial screening: Select top nsis parameters with highest marginal correlations
+    2. Fit Elastic Net on selected parameters, keep only non-zero coefficients
+    3. Conditional screening: Screen remaining parameters against residuals
+    4. Add top parameters from conditional screening to active set
+    5. Repeat until convergence or max iterations
 
-    This implementation uses Elastic Net regression (as recommended in ISIS+,
-    Fan & Song 2010) instead of OLS, which provides better stability when
-    selected parameters are correlated or when the number of selected parameters
-    approaches the ensemble size.
+    This implementation follows the R package 'SIS' by Fan et al., using Elastic Net
+    for the penalized regression step (as recommended in ISIS+, Fan & Song 2010).
 
     References
     ----------
@@ -59,21 +57,25 @@ class ISIS_ESMDA(BaseESMDA):
 
     Fan, J., & Song, R. (2010). Sure independence screening in generalized linear
     models with NP-dimensionality. The Annals of Statistics, 38(6), 3567-3604.
+
+    Saldana, D.F., & Feng, Y. (2018). SIS: An R package for sure independence screening.
+    Journal of Statistical Software, 83(2), 1-25.
     """
 
     @staticmethod
     def isis_screening(
         X: npt.NDArray[np.double],
         Y: npt.NDArray[np.double],
-        max_iterations: int = 5,
-        d: Optional[int] = None,
+        max_iterations: int = 10,
+        nsis: Optional[int] = None,
     ) -> npt.NDArray[np.bool_]:
         """Perform Iterative Sure Independence Screening (ISIS) with Elastic Net.
 
-        This implements ISIS with Elastic Net regression for computing residuals.
-        In each iteration, the top d parameters (by correlation with residuals)
-        are selected, then Elastic Net is used to regress the response on selected
-        parameters to compute residuals for the next iteration.
+        This implements the ISIS algorithm as described in the R 'SIS' package:
+        1. Screen: Select top nsis parameters by correlation with response/residuals
+        2. Select: Fit Elastic Net, keep only non-zero coefficients
+        3. Conditional screen: Screen remaining parameters against residuals
+        4. Iterate until convergence or max iterations
 
         Parameters
         ----------
@@ -82,9 +84,9 @@ class ISIS_ESMDA(BaseESMDA):
         Y : np.ndarray
             Response matrix of shape (num_observations, ensemble_size).
         max_iterations : int
-            Maximum number of ISIS iterations. Default is 5.
-        d : int or None
-            Number of parameters to select per iteration.
+            Maximum number of ISIS iterations. Default is 10.
+        nsis : int or None
+            Maximum number of parameters to recruit by screening.
             If None, uses floor(ensemble_size / log(ensemble_size)) as
             recommended by Fan & Lv (2008).
 
@@ -97,88 +99,113 @@ class ISIS_ESMDA(BaseESMDA):
         num_params, ensemble_size = X.shape
         num_obs = Y.shape[0]
 
-        # Default d: floor(n / log(n)) as suggested by Fan & Lv (2008)
-        if d is None:
-            d = max(1, int(ensemble_size / np.log(ensemble_size + 1)))
+        # Default nsis: floor(n / log(n)) as suggested by Fan & Lv (2008)
+        if nsis is None:
+            nsis = max(1, int(ensemble_size / np.log(ensemble_size + 1)))
 
-        # Initialize: all parameters are candidates, none are selected
+        # Initialize output
         significant = np.zeros((num_params, num_obs), dtype=bool)
 
-        # Center X and Y
+        # Center X for correlation computation
         X_centered = X - np.mean(X, axis=1, keepdims=True)
-        Y_centered = Y - np.mean(Y, axis=1, keepdims=True)
 
-        # Compute standard deviations (with small epsilon to avoid division by zero)
+        # Compute standard deviations
         eps = 1e-10
         stds_X = np.std(X, axis=1, ddof=1)
         stds_X = np.where(stds_X < eps, eps, stds_X)
 
-        # Process each observation/response independently
+        # Process each observation independently
         for obs_idx in range(num_obs):
-            y = Y_centered[obs_idx, :]  # Shape: (ensemble_size,)
+            y = Y[obs_idx, :]  # Shape: (ensemble_size,)
+            y_centered = y - np.mean(y)
 
-            # Track selected and remaining parameter indices
+            # Track selected parameters and history for convergence check
             selected_params: List[int] = []
-            remaining_params = list(range(num_params))
+            remaining_params = set(range(num_params))
+            models_history: List[frozenset] = []
 
-            # Current residual (starts as the response itself)
-            residual = y.copy()
-
-            for iteration in range(max_iterations):
+            for iteration in range(max_iterations + 1):  # +1 for initial screening
                 if not remaining_params:
                     break
 
-                # Compute correlations between remaining parameters and residual
-                X_remaining = X_centered[remaining_params, :]  # (n_remaining, ensemble)
-                stds_remaining = stds_X[remaining_params]
+                # Step 1: SCREENING
+                # Compute correlations with current target (y or residual)
+                if iteration == 0:
+                    # Initial screening: correlate with y
+                    target = y_centered
+                else:
+                    # Conditional screening: correlate with residual
+                    target = residual
 
-                # Correlation: cov(X_i, residual) / (std_X_i * std_residual)
-                std_residual = np.std(residual, ddof=1)
-                if std_residual < eps:
-                    # Residual has no variance - we've explained everything
+                std_target = np.std(target, ddof=1)
+                if std_target < eps:
                     break
 
-                # Compute correlations with residual
-                cov_with_residual = (
-                    np.mean(X_remaining * residual[np.newaxis, :], axis=1)
-                    - np.mean(X_remaining, axis=1) * np.mean(residual)
-                )
-                correlations = np.abs(cov_with_residual / (stds_remaining * std_residual))
+                # Compute correlations for remaining parameters
+                remaining_list = list(remaining_params)
+                X_remaining = X_centered[remaining_list, :]
+                stds_remaining = stds_X[remaining_list]
 
-                # Select top d parameters (original ISIS: no threshold, just top d)
-                n_select = min(d, len(remaining_params))
-                top_indices = np.argsort(correlations)[-n_select:]
-                new_selected = [remaining_params[i] for i in top_indices]
+                cov_with_target = np.mean(
+                    X_remaining * target[np.newaxis, :], axis=1
+                ) - np.mean(X_remaining, axis=1) * np.mean(target)
+                correlations = np.abs(cov_with_target / (stds_remaining * std_target))
 
-                if not new_selected:
+                # Select top parameters (up to nsis - len(selected))
+                n_to_select = min(nsis - len(selected_params), len(remaining_list))
+                if n_to_select <= 0:
                     break
 
-                # Add newly selected parameters
-                selected_params.extend(new_selected)
-                for p in new_selected:
-                    remaining_params.remove(p)
+                top_indices = np.argsort(correlations)[-n_to_select:]
+                newly_screened = [remaining_list[i] for i in top_indices]
 
-                # Update residual using Elastic Net regression
-                # X_sel shape: (ensemble_size, n_selected)
-                X_sel = X_centered[selected_params, :].T
+                # Add to selected set
+                candidate_params = selected_params + newly_screened
+                for p in newly_screened:
+                    remaining_params.discard(p)
+
+                # Step 2: SELECTION via Elastic Net
+                # Fit Elastic Net on candidate parameters, keep non-zero coefficients
+                X_candidates = X_centered[candidate_params, :].T  # (ensemble, n_candidates)
 
                 try:
-                    # Use ElasticNetCV with automatic cross-validation for lambda
-                    # l1_ratio=0.5 gives equal weight to L1 and L2 penalties
                     with warnings.catch_warnings():
                         warnings.filterwarnings("ignore", category=sp.optimize.OptimizeWarning)
                         warnings.filterwarnings("ignore", message=".*Objective did not converge.*")
                         model = ElasticNetCV(
                             l1_ratio=0.5,
-                            cv=min(5, ensemble_size),  # 5-fold CV or less if small ensemble
-                            fit_intercept=False,  # Data is already centered
+                            cv=min(5, ensemble_size),
+                            fit_intercept=False,
                             max_iter=10000,
                         )
-                        model.fit(X_sel, y)
-                    y_predicted = model.predict(X_sel)
-                    residual = y - y_predicted
+                        model.fit(X_candidates, y_centered)
+
+                    # Keep only parameters with non-zero coefficients
+                    nonzero_mask = np.abs(model.coef_) > eps
+                    selected_params = [candidate_params[i] for i, nz in enumerate(nonzero_mask) if nz]
+
+                    if not selected_params:
+                        # No variables selected - use all candidates
+                        selected_params = candidate_params
+
+                    # Compute residual for next iteration
+                    y_predicted = model.predict(X_candidates)
+                    residual = y_centered - y_predicted
+
                 except Exception:
-                    # If Elastic Net fails, stop iterating
+                    # If Elastic Net fails, keep all candidates
+                    selected_params = candidate_params
+                    break
+
+                # Step 3: CONVERGENCE CHECK
+                current_model = frozenset(selected_params)
+                if current_model in models_history:
+                    # Model already selected before - converged
+                    break
+                models_history.append(current_model)
+
+                # Check if we've reached nsis
+                if len(selected_params) >= nsis:
                     break
 
             # Mark selected parameters as significant for this observation
@@ -198,8 +225,8 @@ class ISIS_ESMDA(BaseESMDA):
         cov_YY: Optional[npt.NDArray[np.double]] = None,
         progress_callback: Optional[Callable[[Sequence[T]], Sequence[T]]] = None,
         n_jobs: int = 1,
-        max_iterations: int = 5,
-        d: Optional[int] = None,
+        max_iterations: int = 10,
+        nsis: Optional[int] = None,
     ) -> npt.NDArray[np.double]:
         """Assimilate data using ISIS for adaptive localization.
 
@@ -228,9 +255,9 @@ class ISIS_ESMDA(BaseESMDA):
         n_jobs : int
             Number of parallel jobs. Default is 1.
         max_iterations : int
-            Maximum number of ISIS iterations. Default is 5.
-        d : int or None
-            Number of parameters to select per ISIS iteration.
+            Maximum number of ISIS iterations. Default is 10.
+        nsis : int or None
+            Maximum number of parameters to recruit by ISIS screening.
             If None, uses floor(ensemble_size / log(ensemble_size)).
 
         Returns
@@ -253,7 +280,7 @@ class ISIS_ESMDA(BaseESMDA):
             X=X,
             Y=Y,
             max_iterations=max_iterations,
-            d=d,
+            nsis=nsis,
         )
 
         # Step 2: Compute cross-covariance for significant pairs
