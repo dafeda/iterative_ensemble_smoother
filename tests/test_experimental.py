@@ -546,12 +546,12 @@ class TestISIS_ESMDA:
 
         # Problem dimensions: p >> n (ultrahigh dimensional)
         num_parameters = 2000
-        num_observations = 20
+        num_observations = 200
         ensemble_size = 50
 
         # Create sparse forward model with local neighborhoods
-        # Each observation depends on a neighborhood of ~20 parameters
-        neighborhood_size = 20
+        # Each observation depends on a neighborhood of ~10 parameters
+        neighborhood_size = 10
         A = np.zeros((num_observations, num_parameters))
 
         # Distribute observations across the parameter space
