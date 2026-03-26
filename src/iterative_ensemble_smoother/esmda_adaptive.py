@@ -26,6 +26,8 @@ that share the same correlation pattern with the responses.
 """
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Union
 
 import numpy as np
@@ -239,12 +241,18 @@ class AdaptiveESMDA(BaseESMDA):
 
         alpha = self.alpha[self.iteration]
         delta_D = self.delta_DT.T
-        # Loop over observation indices (integer mask) and param idx (bool mask)
-        for param_idx, response_idx in groupby_rows(mask_keep):
-            # Skip parameters if no responses have correlations
-            if not np.any(response_idx):
-                continue
 
+        # Collect groups, filtering out those with no correlated responses
+        groups = [
+            (param_idx, response_idx)
+            for param_idx, response_idx in groupby_rows(mask_keep)
+            if np.any(response_idx)
+        ]
+
+        def _update_group(
+            param_idx: npt.NDArray[np.int_],
+            response_idx: npt.NDArray[np.bool_],
+        ) -> tuple[npt.NDArray[np.int_], npt.NDArray[np.floating]]:
             logger.debug(
                 f"Assimilating {len(param_idx)} parameters that share "
                 "the same correlation structure with observations."
@@ -268,9 +276,9 @@ class AdaptiveESMDA(BaseESMDA):
                 truncation=self.truncation,
             )
 
-            # Multiply together and store results
+            # Multiply together and return results
             corr_mask = np.ix_(param_idx, response_idx)
-            X[param_idx, :] += np.linalg.multi_dot(
+            return param_idx, np.linalg.multi_dot(
                 [
                     corr_XY[corr_mask],
                     factor1,
@@ -278,6 +286,22 @@ class AdaptiveESMDA(BaseESMDA):
                     self.D_obs_minus_D[response_idx, :],
                 ]
             )
+
+        max_workers = min(len(groups), os.cpu_count() or 1)
+        if max_workers <= 1:
+            # No benefit from threading with 0 or 1 groups
+            for param_idx, response_idx in groups:
+                pidx, update = _update_group(param_idx, response_idx)
+                X[pidx, :] += update
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(_update_group, param_idx, response_idx)
+                    for param_idx, response_idx in groups
+                ]
+                for future in futures:
+                    pidx, update = future.result()
+                    X[pidx, :] += update
 
         return X
 
@@ -483,8 +507,11 @@ class TaperedAdaptiveESMDA(BaseESMDA):
         alpha = self.alpha[self.iteration]
         delta_D = self.delta_DT.T
 
-        # Loop over every parameter index i
-        for i in range(corr_XY.shape[0]):
+        n_params = corr_XY.shape[0]
+
+        def _update_param(
+            i: int,
+        ) -> tuple[int, npt.NDArray[np.floating]]:
             # How much each response should be inflated
             inflation_factor_i = inflation_factors[i, :]
 
@@ -506,8 +533,8 @@ class TaperedAdaptiveESMDA(BaseESMDA):
                 truncation=self.truncation,
             )
 
-            # Multiply together and store results
-            X[[i], :] += np.linalg.multi_dot(
+            # Multiply together and return results
+            return i, np.linalg.multi_dot(
                 [
                     corr_XY[[i]],
                     factor1,
@@ -515,6 +542,18 @@ class TaperedAdaptiveESMDA(BaseESMDA):
                     self.D_obs_minus_D,
                 ]
             )
+
+        max_workers = min(n_params, os.cpu_count() or 1)
+        if max_workers <= 1:
+            for i in range(n_params):
+                idx, update = _update_param(i)
+                X[[idx], :] += update
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(_update_param, i) for i in range(n_params)]
+                for future in futures:
+                    idx, update = future.result()
+                    X[[idx], :] += update
 
         return X
 
